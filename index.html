@@ -434,6 +434,14 @@
     animation: spin 0.8s linear infinite;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes slideIn {
+    from { transform: translateX(100px); opacity: 0; }
+    to { transform: translateX(0); opacity: 1; }
+  }
+  @keyframes fadeOut {
+    from { opacity: 1; }
+    to { opacity: 0; }
+  }
 </style>
 </head>
 <body>
@@ -494,8 +502,8 @@
         <p>⚪ Отключена | Настройте для синхронизации между устройствами</p>
       </div>
       <div style="display:flex; gap:10px; flex-wrap:wrap;">
-        <button class="btn btn-success" onclick="syncFromGist()">⬇️ Загрузить</button>
-        <button class="btn btn-primary" onclick="syncToGist()">⬆️ Сохранить</button>
+        <button class="btn btn-success" onclick="syncFromGist(true)">⬇️ Загрузить</button>
+        <button class="btn btn-primary" onclick="syncToGist(true)">⬆️ Сохранить</button>
         <button class="btn btn-info" onclick="openGistConfig()">⚙️ Настройки</button>
       </div>
     </div>
@@ -604,10 +612,18 @@
         Создайте Secret Gist: gist.github.com → вставьте любой текст → Create secret gist → скопируйте ID из URL
       </p>
     </div>
-    <div style="margin-bottom:15px;">
-      <label style="display:flex; align-items:center; gap:10px; cursor:pointer; color:#ccc;">
+    <div style="margin-bottom:10px; padding:10px; background:rgba(255,255,255,0.03); border-radius:8px;">
+      <label style="display:flex; align-items:center; gap:10px; cursor:pointer; color:#ccc; margin-bottom:8px;">
         <input type="checkbox" id="gistEnabled" style="width:18px; height:18px;">
-        Включить синхронизацию
+        <strong>Включить синхронизацию</strong>
+      </label>
+      <label style="display:flex; align-items:center; gap:10px; cursor:pointer; color:#888; margin-bottom:6px; font-size:0.85rem;">
+        <input type="checkbox" id="gistAutoSave" style="width:16px; height:16px;">
+        💾 Автосохранение после каждого изменения (2 сек задержка)
+      </label>
+      <label style="display:flex; align-items:center; gap:10px; cursor:pointer; color:#888; font-size:0.85rem;">
+        <input type="checkbox" id="gistAutoLoad" style="width:16px; height:16px;">
+        🔄 Автозагрузка при открытии + проверка каждые 60 сек
       </label>
     </div>
     <div class="modal-actions">
@@ -646,42 +662,63 @@ const TEAM_MAP = {
 const TEAMS = ["Акрон","Ахмат","Балтика","Динамо М","Динамо Мх","Зенит","Краснодар","Крылья Советов","Локомотив М","Оренбург","Родина","Ростов","Рубин","Спартак М","Факел","ЦСКА"];
 
 // ===================== GITHUB GIST SYNC =====================
-// Для синхронизации между устройствами через GitHub Gist
-// 1. Создайте Personal Access Token на github.com/settings/tokens (scope: gist)
-// 2. Создайте Secret Gist на gist.github.com и скопируйте его ID из URL
-// 3. Вставьте значения ниже:
-
 const GIST_CONFIG = {
-  token: '',      // Вставьте ваш GitHub Personal Access Token
-  gistId: '',     // Вставьте ID Gist (последняя часть URL gist.github.com/USERNAME/ID)
-  enabled: false  // Установите true после настройки
+  token: '',
+  gistId: '',
+  enabled: false,
+  autoSave: true,      // Автосохранение после каждого изменения
+  autoLoad: true,      // Автозагрузка при открытии
+  autoSyncInterval: 60000 // Проверка обновлений каждые 60 сек
 };
 
-// Load Gist config from localStorage if saved
+let gistAutoSyncTimer = null;
+let pendingGistSave = false;
+let lastGistContentHash = '';
+
 const savedGistConfig = localStorage.getItem('rpl_gist_config');
 if (savedGistConfig) {
   const parsed = JSON.parse(savedGistConfig);
   GIST_CONFIG.token = parsed.token || '';
   GIST_CONFIG.gistId = parsed.gistId || '';
   GIST_CONFIG.enabled = parsed.enabled || false;
+  GIST_CONFIG.autoSave = parsed.autoSave !== false;
+  GIST_CONFIG.autoLoad = parsed.autoLoad !== false;
+  GIST_CONFIG.autoSyncInterval = parsed.autoSyncInterval || 60000;
 }
 
-async function syncToGist() {
-  if (!GIST_CONFIG.enabled || !GIST_CONFIG.token || !GIST_CONFIG.gistId) {
-    alert('⚠️ Настройте GitHub Gist в настройках синхронизации');
-    return false;
-  }
-
-  const syncData = {
+function getSyncData() {
+  return {
     predictors: predictors,
     predictions: predictions,
     championPredictions: championPredictions,
     lastSync: new Date().toISOString(),
-    version: '1.0'
+    version: '1.0',
+    device: navigator.userAgent.substring(0, 50)
   };
+}
+
+function getContentHash(data) {
+  // Simple hash for comparing content
+  return JSON.stringify(data).length + '-' + Object.keys(data.predictions).length;
+}
+
+async function syncToGist(showStatus = true) {
+  if (!GIST_CONFIG.enabled || !GIST_CONFIG.token || !GIST_CONFIG.gistId) {
+    if (showStatus) alert('⚠️ Настройте GitHub Gist в настройках синхронизации');
+    return false;
+  }
+
+  const syncData = getSyncData();
+  const newHash = getContentHash(syncData);
+
+  // Don't save if nothing changed
+  if (newHash === lastGistContentHash && !pendingGistSave) {
+    console.log('Gist: no changes, skip save');
+    return true;
+  }
 
   try {
-    updateApiStatus('syncing', 'Синхронизация с GitHub...');
+    if (showStatus) updateApiStatus('syncing', 'Сохранение в GitHub...');
 
     const response = await fetch(`https://api.github.com/gists/${GIST_CONFIG.gistId}`, {
       method: 'PATCH',
@@ -704,25 +741,28 @@ async function syncToGist() {
       throw new Error(err.message || `HTTP ${response.status}`);
     }
 
+    lastGistContentHash = newHash;
+    pendingGistSave = false;
     const lastSync = new Date().toLocaleString('ru-RU');
     localStorage.setItem('rpl_lastGistSync', lastSync);
-    updateApiStatus('online', `Синхронизировано: ${lastSync}`);
+    if (showStatus) updateApiStatus('online', `Сохранено: ${lastSync}`);
+    renderGistPanel();
     return true;
   } catch (error) {
-    console.error('Gist sync error:', error);
-    updateApiStatus('offline', `Ошибка Gist: ${error.message}`);
+    console.error('Gist save error:', error);
+    if (showStatus) updateApiStatus('offline', `Ошибка сохранения: ${error.message}`);
     return false;
   }
 }
 
-async function syncFromGist() {
+async function syncFromGist(showStatus = true, force = false) {
   if (!GIST_CONFIG.enabled || !GIST_CONFIG.token || !GIST_CONFIG.gistId) {
-    alert('⚠️ Настройте GitHub Gist в настройках синхронизации');
+    if (showStatus) alert('⚠️ Настройте GitHub Gist в настройках синхронизации');
     return false;
   }
 
   try {
-    updateApiStatus('syncing', 'Загрузка из GitHub...');
+    if (showStatus) updateApiStatus('syncing', 'Загрузка из GitHub...');
 
     const response = await fetch(`https://api.github.com/gists/${GIST_CONFIG.gistId}`, {
       method: 'GET',
@@ -745,11 +785,25 @@ async function syncFromGist() {
     }
 
     const syncData = JSON.parse(file.content);
+    const newHash = getContentHash(syncData);
 
-    // Merge data (local takes precedence for current predictor, remote for others)
+    // Skip if same content and not forced
+    if (!force && newHash === lastGistContentHash) {
+      console.log('Gist: no new data, skip load');
+      return true;
+    }
+
+    lastGistContentHash = newHash;
+
+    // Merge data
+    let hasChanges = false;
+
     if (syncData.predictors) {
       syncData.predictors.forEach(p => {
-        if (!predictors.includes(p)) predictors.push(p);
+        if (!predictors.includes(p)) {
+          predictors.push(p);
+          hasChanges = true;
+        }
       });
     }
 
@@ -759,6 +813,7 @@ async function syncFromGist() {
         Object.entries(preds).forEach(([key, val]) => {
           if (!predictions[predName][key] || predictions[predName][key].home === '') {
             predictions[predName][key] = val;
+            hasChanges = true;
           }
         });
       });
@@ -768,32 +823,96 @@ async function syncFromGist() {
       Object.entries(syncData.championPredictions).forEach(([predName, team]) => {
         if (!championPredictions[predName]) {
           championPredictions[predName] = team;
+          hasChanges = true;
         }
       });
     }
 
-    // Save merged data
+    // Save merged data locally
     localStorage.setItem('rpl_predictors', JSON.stringify(predictors));
     localStorage.setItem('rpl_predictions', JSON.stringify(predictions));
     localStorage.setItem('rpl_champion', JSON.stringify(championPredictions));
 
     const lastSync = new Date().toLocaleString('ru-RU');
     localStorage.setItem('rpl_lastGistSync', lastSync);
-    updateApiStatus('online', `Загружено: ${lastSync}`);
+    if (showStatus) updateApiStatus('online', `Загружено: ${lastSync}`);
 
-    // Refresh UI
-    updatePredictorSelect();
-    renderMatches();
-    updateStandings();
-    updatePredictorsTable();
-    renderChampionSection();
-    renderStats();
+    // Refresh UI if changes detected
+    if (hasChanges) {
+      updatePredictorSelect();
+      renderMatches();
+      updateStandings();
+      updatePredictorsTable();
+      renderChampionSection();
+      renderStats();
+      if (showStatus) {
+        // Show subtle notification
+        showToast('🔄 Данные обновлены из облака');
+      }
+    }
 
+    renderGistPanel();
     return true;
   } catch (error) {
     console.error('Gist load error:', error);
-    updateApiStatus('offline', `Ошибка загрузки: ${error.message}`);
+    if (showStatus) updateApiStatus('offline', `Ошибка загрузки: ${error.message}`);
     return false;
+  }
+}
+
+function showToast(message) {
+  // Create toast notification
+  const existing = document.getElementById('gistToast');
+  if (existing) existing.remove();
+
+  const toast = document.createElement('div');
+  toast.id = 'gistToast';
+  toast.style.cssText = `
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    background: linear-gradient(90deg, #00d26a, #00b894);
+    color: white;
+    padding: 12px 20px;
+    border-radius: 10px;
+    font-weight: 600;
+    z-index: 9999;
+    box-shadow: 0 4px 15px rgba(0,210,106,0.4);
+    animation: slideIn 0.3s ease;
+  `;
+  toast.textContent = message;
+  document.body.appendChild(toast);
+
+  setTimeout(() => {
+    toast.style.animation = 'fadeOut 0.3s ease';
+    setTimeout(() => toast.remove(), 300);
+  }, 3000);
+}
+
+function scheduleGistSave() {
+  pendingGistSave = true;
+  if (GIST_CONFIG.enabled && GIST_CONFIG.autoSave) {
+    // Debounce: save 2 seconds after last change
+    clearTimeout(window._gistSaveTimer);
+    window._gistSaveTimer = setTimeout(() => {
+      syncToGist(false);
+    }, 2000);
+  }
+}
+
+function startGistAutoSync() {
+  if (gistAutoSyncTimer) clearInterval(gistAutoSyncTimer);
+  if (GIST_CONFIG.enabled && GIST_CONFIG.autoSyncInterval > 0) {
+    gistAutoSyncTimer = setInterval(() => {
+      syncFromGist(false, false);
+    }, GIST_CONFIG.autoSyncInterval);
+  }
+}
+
+function stopGistAutoSync() {
+  if (gistAutoSyncTimer) {
+    clearInterval(gistAutoSyncTimer);
+    gistAutoSyncTimer = null;
   }
 }
 
@@ -801,6 +920,8 @@ function saveGistConfig() {
   const token = document.getElementById('gistToken').value.trim();
   const gistId = document.getElementById('gistId').value.trim();
   const enabled = document.getElementById('gistEnabled').checked;
+  const autoSave = document.getElementById('gistAutoSave').checked;
+  const autoLoad = document.getElementById('gistAutoLoad').checked;
 
   if (enabled && (!token || !gistId)) {
     alert('Введите токен и ID Gist для включения синхронизации');
@@ -810,13 +931,18 @@ function saveGistConfig() {
   GIST_CONFIG.token = token;
   GIST_CONFIG.gistId = gistId;
   GIST_CONFIG.enabled = enabled;
+  GIST_CONFIG.autoSave = autoSave;
+  GIST_CONFIG.autoLoad = autoLoad;
 
   localStorage.setItem('rpl_gist_config', JSON.stringify(GIST_CONFIG));
   closeModal('gistConfigModal');
 
   if (enabled) {
-    alert('✅ Синхронизация включена! Используйте кнопки ↑ Загрузить / ↓ Сохранить');
+    startGistAutoSync();
+    if (autoLoad) syncFromGist(true);
+    alert('✅ Синхронизация включена!');
   } else {
+    stopGistAutoSync();
     alert('Синхронизация отключена');
   }
 
@@ -828,7 +954,9 @@ function renderGistPanel() {
   if (!panel) return;
 
   const lastSync = localStorage.getItem('rpl_lastGistSync') || 'никогда';
-  const status = GIST_CONFIG.enabled ? '🟢 Активна' : '⚪ Отключена';
+  const status = GIST_CONFIG.enabled 
+    ? (GIST_CONFIG.autoSave ? '🟢 Авто' : '🟢 Вручную') 
+    : '⚪ Отключена';
 
   panel.innerHTML = `
     <div class="sync-info">
@@ -836,8 +964,8 @@ function renderGistPanel() {
       <p>${status} | Последняя синхронизация: ${lastSync}</p>
     </div>
     <div style="display:flex; gap:10px; flex-wrap:wrap;">
-      <button class="btn btn-success" onclick="syncFromGist()">⬇️ Загрузить</button>
-      <button class="btn btn-primary" onclick="syncToGist()">⬆️ Сохранить</button>
+      <button class="btn btn-success" onclick="syncFromGist(true)">⬇️ Загрузить</button>
+      <button class="btn btn-primary" onclick="syncToGist(true)">⬆️ Сохранить</button>
       <button class="btn btn-info" onclick="openGistConfig()">⚙️ Настройки</button>
     </div>
   `;
@@ -847,6 +975,8 @@ function openGistConfig() {
   document.getElementById('gistToken').value = GIST_CONFIG.token;
   document.getElementById('gistId').value = GIST_CONFIG.gistId;
   document.getElementById('gistEnabled').checked = GIST_CONFIG.enabled;
+  document.getElementById('gistAutoSave').checked = GIST_CONFIG.autoSave;
+  document.getElementById('gistAutoLoad').checked = GIST_CONFIG.autoLoad;
   document.getElementById('gistConfigModal').classList.add('active');
 }
 
@@ -1010,7 +1140,6 @@ function init() {
   updatePredictorsTable();
   renderChampionSection();
   renderStats();
-  renderGistPanel();
 
   // Initial sync
   fetchGamesFromAPI();
@@ -1086,6 +1215,9 @@ function addPredictor() {
   closeModal('addPredictorModal');
   document.getElementById('newPredictorName').value = '';
   renderMatches();
+
+  // Auto-sync new predictor to Gist
+  scheduleGistSave();
 }
 
 function closeModal(id) { document.getElementById(id).classList.remove('active'); }
@@ -1180,12 +1312,25 @@ function updatePrediction(round, idx, side, value) {
   if (!predictions[currentPredictor]) predictions[currentPredictor] = {};
   if (!predictions[currentPredictor][key]) predictions[currentPredictor][key] = { home: '', away: '' };
   predictions[currentPredictor][key][side] = value;
+
+  // Auto-save to Gist after prediction change
+  scheduleGistSave();
 }
 
 function savePredictions() {
   if (!currentPredictor) return alert('Выберите прогнозиста');
   localStorage.setItem('rpl_predictions', JSON.stringify(predictions));
-  alert('✅ Прогнозы сохранены!');
+
+  // Also sync to Gist if enabled
+  if (GIST_CONFIG.enabled && GIST_CONFIG.autoSave) {
+    syncToGist(false).then(ok => {
+      if (ok) showToast('✅ Сохранено локально и в облаке');
+      else alert('✅ Сохранено локально');
+    });
+  } else {
+    alert('✅ Прогнозы сохранены!');
+  }
+
   renderMatches();
 }
 
@@ -1313,6 +1458,9 @@ function saveChampionPrediction() {
   alert(`✅ Прогноз на чемпиона сохранён: ${team}`);
   renderChampionSection();
   updatePredictorsTable();
+
+  // Auto-sync to Gist
+  scheduleGistSave();
 }
 
 function renderChampionSection() {
